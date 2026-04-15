@@ -4,8 +4,14 @@ import os
 import socket
 import sys
 import threading
+import time
 import traceback
 from typing import Optional
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 try:
     from utils.network_tools import get_default_interface_ipv4
@@ -24,6 +30,31 @@ def get_exe_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def configure_keepalive(sock: socket.socket) -> None:
+    sock.setblocking(False)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+
+def build_windivert_filter(interface_ipv4: str, connect_ip: str, handshake_only: bool) -> str:
+    addr_filter = (
+        "("
+        + "(ip.SrcAddr == " + interface_ipv4 + " and ip.DstAddr == " + connect_ip + ")"
+        + " or "
+        + "(ip.SrcAddr == " + connect_ip + " and ip.DstAddr == " + interface_ipv4 + ")"
+        + ")"
+    )
+    if handshake_only:
+        return (
+            "tcp and tcp.PayloadLength == 0 and "
+            + addr_filter
+            + " and (tcp.Syn or tcp.Ack or tcp.Rst or tcp.Fin)"
+        )
+    return "tcp and " + addr_filter
+
+
 config_path = os.path.join(get_exe_dir(), "config.json")
 with open(config_path, "r", encoding="utf-8") as f:
     config = json.load(f)
@@ -37,8 +68,38 @@ INTERFACE_IPV4 = get_default_interface_ipv4(CONNECT_IP)
 DATA_MODE = "tls"
 BYPASS_METHOD = "wrong_seq"
 
+DEBUG = bool(config.get("DEBUG", False))
+HANDLE_LIMIT = int(config.get("HANDLE_LIMIT", 128))
+ACCEPT_BACKLOG = int(config.get("ACCEPT_BACKLOG", max(HANDLE_LIMIT * 2, 128)))
+CONNECT_TIMEOUT = float(config.get("CONNECT_TIMEOUT", 5.0))
+HANDSHAKE_TIMEOUT = float(config.get("HANDSHAKE_TIMEOUT", 2.0))
+RESOURCE_PRESSURE_BACKOFF = float(config.get("RESOURCE_PRESSURE_BACKOFF", 0.5))
+FAKE_SEND_WORKERS = int(config.get("FAKE_SEND_WORKERS", 2))
+NARROW_WINDIVERT_FILTER = bool(config.get("NARROW_WINDIVERT_FILTER", True))
+
 fake_injective_connections: dict[tuple, FakeInjectiveConnection] = {}
 fake_injective_connections_lock = threading.Lock()
+active_handle_tasks: set[asyncio.Task] = set()
+handle_semaphore = asyncio.Semaphore(HANDLE_LIMIT)
+resource_pressure_until = 0.0
+
+
+def log_debug(*args) -> None:
+    if DEBUG:
+        print(*args)
+
+
+def mark_resource_pressure(seconds: float = RESOURCE_PRESSURE_BACKOFF) -> None:
+    global resource_pressure_until
+    until = time.monotonic() + max(0.0, seconds)
+    if until > resource_pressure_until:
+        resource_pressure_until = until
+
+
+async def maybe_backoff_for_resource_pressure() -> None:
+    delay = resource_pressure_until - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 def register_fake_connection(connection: FakeInjectiveConnection) -> None:
@@ -99,7 +160,11 @@ async def relay_main_loop(
 
     except asyncio.CancelledError:
         raise
-    except (ConnectionError, OSError):
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10055:
+            mark_resource_pressure()
+        return "socket_error"
+    except ConnectionError:
         return "socket_error"
 
 
@@ -149,6 +214,7 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr) -> None:
     fake_injective_conn = None
 
     try:
+        await maybe_backoff_for_resource_pressure()
         loop = asyncio.get_running_loop()
 
         if DATA_MODE == "tls":
@@ -162,12 +228,8 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr) -> None:
             sys.exit("impossible mode!")
 
         outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        outgoing_sock.setblocking(False)
+        configure_keepalive(outgoing_sock)
         outgoing_sock.bind((INTERFACE_IPV4, 0))
-        outgoing_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
         src_port = outgoing_sock.getsockname()[1]
         fake_injective_conn = FakeInjectiveConnection(
@@ -183,14 +245,21 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr) -> None:
         register_fake_connection(fake_injective_conn)
 
         try:
-            await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
-        except Exception:
+            await asyncio.wait_for(loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT)), CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            log_debug("connect timeout:", incoming_remote_addr)
+            return
+        except OSError as e:
+            if getattr(e, "winerror", None) == 10055:
+                mark_resource_pressure()
+            log_debug("connect socket error:", repr(e))
             return
 
         if BYPASS_METHOD == "wrong_seq":
             try:
-                await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), 2)
+                await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), HANDSHAKE_TIMEOUT)
             except asyncio.TimeoutError:
+                log_debug("handshake timeout:", incoming_remote_addr)
                 return
 
             if fake_injective_conn.t2a_msg == "unexpected_close":
@@ -207,6 +276,10 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr) -> None:
 
     except asyncio.CancelledError:
         raise
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10055:
+            mark_resource_pressure()
+        print("handle socket error:", e)
     except Exception:
         traceback.print_exc()
     finally:
@@ -218,43 +291,65 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr) -> None:
         await close_socket(incoming_sock)
 
 
+async def handle_wrapper(incoming_sock: socket.socket, incoming_remote_addr) -> None:
+    try:
+        await handle(incoming_sock, incoming_remote_addr)
+    finally:
+        handle_semaphore.release()
+
+
+def _on_handle_task_done(task: asyncio.Task) -> None:
+    active_handle_tasks.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        print("handle task failed:", repr(exc))
+
+
 async def main() -> None:
+    if not INTERFACE_IPV4:
+        sys.exit("no interface ipv4 found for CONNECT_IP")
+
     mother_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     mother_sock.setblocking(False)
     mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     mother_sock.bind((LISTEN_HOST, LISTEN_PORT))
-    mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-    mother_sock.listen()
+    mother_sock.listen(ACCEPT_BACKLOG)
 
     loop = asyncio.get_running_loop()
     try:
         while True:
-            incoming_sock, addr = await loop.sock_accept(mother_sock)
-            incoming_sock.setblocking(False)
-            incoming_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-            incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-            incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-            asyncio.create_task(handle(incoming_sock, addr))
+            await maybe_backoff_for_resource_pressure()
+            await handle_semaphore.acquire()
+            try:
+                incoming_sock, addr = await loop.sock_accept(mother_sock)
+            except Exception:
+                handle_semaphore.release()
+                raise
+
+            configure_keepalive(incoming_sock)
+
+            task = asyncio.create_task(handle_wrapper(incoming_sock, addr))
+            active_handle_tasks.add(task)
+            task.add_done_callback(_on_handle_task_done)
     finally:
+        for task in list(active_handle_tasks):
+            task.cancel()
+        if active_handle_tasks:
+            await asyncio.gather(*active_handle_tasks, return_exceptions=True)
         await close_socket(mother_sock)
 
 
 if __name__ == "__main__":
-    w_filter = (
-        "tcp and ("
-        + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")"
-        + " or "
-        + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")"
-        + ")"
-    )
+    w_filter = build_windivert_filter(INTERFACE_IPV4, CONNECT_IP, NARROW_WINDIVERT_FILTER)
     fake_tcp_injector = FakeTcpInjector(
         w_filter,
         fake_injective_connections,
         fake_injective_connections_lock,
+        debug=DEBUG,
+        worker_count=FAKE_SEND_WORKERS,
     )
     threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
     print("هشن شومافر تیامح دینکیم هدافتسا دازآ تنرتنیا هب یسرتسد یارب همانرب نیا زا رگا")
@@ -262,4 +357,10 @@ if __name__ == "__main__":
     print()
     print("USDT (BEP20): 0x76a768B53Ca77B43086946315f0BDF21156bF424\n")
     print("@patterniha")
+    print(
+        "HANDLE_LIMIT=", HANDLE_LIMIT,
+        "ACCEPT_BACKLOG=", ACCEPT_BACKLOG,
+        "WORKERS=", FAKE_SEND_WORKERS,
+        "NARROW_FILTER=", NARROW_WINDIVERT_FILTER,
+    )
     asyncio.run(main())

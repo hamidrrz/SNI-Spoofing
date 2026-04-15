@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import socket
 import sys
 import threading
@@ -8,6 +9,19 @@ from pydivert import Packet
 
 from monitor_connection import MonitorConnection
 from injecter import TcpInjector
+
+
+def packet_summary(packet: Packet) -> str:
+    try:
+        return (
+            f"{packet.src_addr}:{packet.tcp.src_port} -> "
+            f"{packet.dst_addr}:{packet.tcp.dst_port} "
+            f"syn={packet.tcp.syn} ack={packet.tcp.ack} "
+            f"rst={packet.tcp.rst} fin={packet.tcp.fin} "
+            f"payload={len(packet.tcp.payload)}"
+        )
+    except Exception:
+        return repr(packet)
 
 
 class FakeInjectiveConnection(MonitorConnection):
@@ -46,16 +60,42 @@ class FakeTcpInjector(TcpInjector):
         w_filter: str,
         connections: dict[tuple, FakeInjectiveConnection],
         connections_lock: threading.Lock,
+        debug: bool = False,
+        worker_count: int = 2,
     ):
         super().__init__(w_filter)
         self.connections = connections
         self.connections_lock = connections_lock
+        self.debug = debug
+        self.fake_send_queue: queue.Queue[tuple[Packet, FakeInjectiveConnection]] = queue.Queue()
+        self.worker_count = max(1, int(worker_count))
+        self._start_workers()
+
+    def _start_workers(self) -> None:
+        for idx in range(self.worker_count):
+            threading.Thread(target=self._fake_send_worker, name=f"fake-send-{idx}", daemon=True).start()
+
+    def _log(self, *args) -> None:
+        if self.debug:
+            print(*args)
 
     def _lookup_connection(self, c_id):
         with self.connections_lock:
             return self.connections.get(c_id)
 
-    def fake_send_thread(self, packet: Packet, connection: FakeInjectiveConnection) -> None:
+    def _close_handshake(self, connection: FakeInjectiveConnection, result: str = "unexpected_close") -> None:
+        connection.monitor = False
+        connection.signal_result(result)
+
+    def _fake_send_worker(self) -> None:
+        while True:
+            packet, connection = self.fake_send_queue.get()
+            try:
+                self.fake_send(packet, connection)
+            finally:
+                self.fake_send_queue.task_done()
+
+    def fake_send(self, packet: Packet, connection: FakeInjectiveConnection) -> None:
         time.sleep(0.001)
         with connection.thread_lock:
             if not connection.monitor:
@@ -75,12 +115,17 @@ class FakeTcpInjector(TcpInjector):
                 sys.exit("not implemented method!")
 
     def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str) -> None:
-        print(info_m, packet)
-        connection.monitor = False
-        connection.signal_result("unexpected_close")
+        self._log(info_m, packet_summary(packet))
+        self._close_handshake(connection, "unexpected_close")
         self.w.send(packet, False)
 
     def on_inbound_packet(self, packet: Packet, connection: FakeInjectiveConnection) -> None:
+        if packet.tcp.rst or packet.tcp.fin:
+            self._log("remote closed during handshake:", packet_summary(packet))
+            self._close_handshake(connection, "unexpected_close")
+            self.w.send(packet, False)
+            return
+
         if connection.syn_seq == -1:
             self.on_unexpected_packet(packet, connection, "unexpected inbound packet, no syn sent!")
             return
@@ -98,20 +143,14 @@ class FakeTcpInjector(TcpInjector):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected inbound syn-ack packet, seq change! "
-                    + str(seq_num)
-                    + " "
-                    + str(connection.syn_ack_seq),
+                    "unexpected inbound syn-ack packet, seq change!",
                 )
                 return
             if ack_num != ((connection.syn_seq + 1) & 0xFFFFFFFF):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected inbound syn-ack packet, ack not matched! "
-                    + str(ack_num)
-                    + " "
-                    + str(connection.syn_seq),
+                    "unexpected inbound syn-ack packet, ack not matched!",
                 )
                 return
 
@@ -133,20 +172,14 @@ class FakeTcpInjector(TcpInjector):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected inbound ack packet, seq not matched! "
-                    + str(seq_num)
-                    + " "
-                    + str(connection.syn_ack_seq),
+                    "unexpected inbound ack packet, seq not matched!",
                 )
                 return
             if ack_num != ((connection.syn_seq + 1) & 0xFFFFFFFF):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected inbound ack packet, ack not matched! "
-                    + str(ack_num)
-                    + " "
-                    + str(connection.syn_seq),
+                    "unexpected inbound ack packet, ack not matched!",
                 )
                 return
 
@@ -157,6 +190,12 @@ class FakeTcpInjector(TcpInjector):
         self.on_unexpected_packet(packet, connection, "unexpected inbound packet")
 
     def on_outbound_packet(self, packet: Packet, connection: FakeInjectiveConnection) -> None:
+        if packet.tcp.rst or packet.tcp.fin:
+            self._log("local closed during handshake:", packet_summary(packet))
+            self._close_handshake(connection, "unexpected_close")
+            self.w.send(packet, False)
+            return
+
         if connection.sch_fake_sent:
             self.on_unexpected_packet(packet, connection, "unexpected outbound packet, recv packet after fake sent!")
             return
@@ -177,10 +216,7 @@ class FakeTcpInjector(TcpInjector):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected outbound syn packet, seq not matched! "
-                    + str(seq_num)
-                    + " "
-                    + str(connection.syn_seq),
+                    "unexpected outbound syn packet, seq not matched!",
                 )
                 return
 
@@ -201,31 +237,30 @@ class FakeTcpInjector(TcpInjector):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected outbound ack packet, seq not matched! "
-                    + str(seq_num)
-                    + " "
-                    + str(connection.syn_seq),
+                    "unexpected outbound ack packet, seq not matched!",
                 )
                 return
             if connection.syn_ack_seq == -1 or ack_num != ((connection.syn_ack_seq + 1) & 0xFFFFFFFF):
                 self.on_unexpected_packet(
                     packet,
                     connection,
-                    "unexpected outbound ack packet, ack not matched! "
-                    + str(ack_num)
-                    + " "
-                    + str(connection.syn_ack_seq),
+                    "unexpected outbound ack packet, ack not matched!",
                 )
                 return
 
             self.w.send(packet, False)
             connection.sch_fake_sent = True
-            threading.Thread(target=self.fake_send_thread, args=(packet, connection), daemon=True).start()
+            self.fake_send_queue.put((packet, connection))
             return
 
         self.on_unexpected_packet(packet, connection, "unexpected outbound packet")
 
     def inject(self, packet: Packet) -> None:
+        # Fast-path: the bypass state machine only needs payload-less control packets.
+        if len(packet.tcp.payload) != 0:
+            self.w.send(packet, False)
+            return
+
         if packet.is_inbound:
             c_id = (packet.ip.dst_addr, packet.tcp.dst_port, packet.ip.src_addr, packet.tcp.src_port)
             connection = self._lookup_connection(c_id)

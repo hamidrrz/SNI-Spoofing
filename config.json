@@ -1,7 +1,15 @@
 {
-  "LISTEN_HOST": "0.0.0.0",
-  "LISTEN_PORT": 40443,
-  "CONNECT_IP": "188.114.98.0",
+  "LISTEN_HOST": "127.0.0.1",
+  "LISTEN_PORT": 400,
+  "CONNECT_IP": "104.16.79.73",
   "CONNECT_PORT": 443,
-  "FAKE_SNI": "auth.vercel.com"
+  "FAKE_SNI": "static.cloudflareinsights.com",
+  "DEBUG": false,
+  "HANDLE_LIMIT": 64,
+  "ACCEPT_BACKLOG": 128,
+  "CONNECT_TIMEOUT": 5.0,
+  "HANDSHAKE_TIMEOUT": 2.0,
+  "RESOURCE_PRESSURE_BACKOFF": 0.5,
+  "FAKE_SEND_WORKERS": 2,
+  "NARROW_WINDIVERT_FILTER": true
 }
